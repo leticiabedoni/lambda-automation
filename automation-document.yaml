@@ -1,0 +1,289 @@
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+description: |
+  (Multi-Conta - Teste) Executa ações automatizadas em funções Lambda: update de configuração, update de código (S3, Container ou Texto Inline), update de alias ou deleção.
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Obrigatório) O ARN da role que o SSM Automation deve assumir.
+  LambdaName:
+    type: String
+    description: (Obrigatório) Nome da função Lambda alvo.
+  ActionType:
+    type: String
+    description: (Obrigatório) Tipo de ação a ser executada.
+    allowedValues:
+      - delete
+      - updateConfig
+      - updateCode
+      - updateAlias
+  ConfigKey:
+    type: String
+    description: (Apenas para updateConfig) Configuração a ser alterada (MemorySize, Timeout, EphemeralStorage).
+    default: ''
+  ConfigValue:
+    type: String
+    description: (Apenas para updateConfig) Novo valor para a configuração.
+    default: ''
+  CodeType:
+    type: String
+    description: (Apenas para updateCode) Tipo de deploy do código (s3, container, inline_text).
+    default: ''
+  S3Bucket:
+    type: String
+    description: (Apenas para updateCode com CodeType=s3) Bucket S3 onde o código está.
+    default: ''
+  S3Key:
+    type: String
+    description: (Apenas para updateCode com CodeType=s3) Chave do objeto .zip no S3.
+    default: ''
+  ImageUri:
+    type: String
+    description: (Apenas para updateCode com CodeType=container) URI da imagem do container no ECR.
+    default: ''
+  HandlerFileName:
+    type: String
+    description: (Apenas para updateCode com CodeType=inline_text) Nome do arquivo de código (ex lambda_function.py).
+    default: ''
+  RawCode:
+    type: String
+    description: (Apenas para updateCode com CodeType=inline_text) O código-fonte puro a ser implantado.
+    default: ''
+  AliasName:
+    type: String
+    description: (Apenas para updateAlias) Nome do alias a ser criado/atualizado (ex prod).
+    default: ''
+  FunctionVersion:
+    type: String
+    description: (Apenas para updateAlias) Versão da função para qual o alias apontará (ex 1, 2).
+    default: ''
+mainSteps:
+  - name: checkLambdaExists
+    action: aws:executeAwsApi
+    nextStep: validateInput
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: lambda
+      Api: GetFunction
+      FunctionName: '{{ LambdaName }}'
+  - name: validateInput
+    action: aws:executeScript
+    nextStep: executeAction
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      Script: |
+        def handler(events, context):
+            errors = []
+            action = events.get('ActionType')
+            
+            if action == 'updateConfig':
+                key = events.get('ConfigKey')
+                value = events.get('ConfigValue')
+                if not key or not value:
+                    errors.append("Para updateConfig, ConfigKey e ConfigValue são obrigatórios.")
+                elif key not in ['MemorySize', 'Timeout', 'EphemeralStorage']:
+                    errors.append(f"ConfigKey '{key}' é inválido. Valores permitidos: MemorySize, Timeout, EphemeralStorage.")
+
+            elif action == 'updateCode':
+                code_type = events.get('CodeType')
+                if not code_type:
+                    errors.append("Para updateCode, CodeType é obrigatório.")
+                elif code_type not in ['s3', 'container', 'inline_text']:
+                    errors.append(f"CodeType '{code_type}' é inválido. Valores permitidos: s3, container, inline_text.")
+                elif code_type == 's3' and (not events.get('S3Bucket') or not events.get('S3Key')):
+                    errors.append("Para CodeType=s3, S3Bucket e S3Key são obrigatórios.")
+                elif code_type == 'container' and not events.get('ImageUri'):
+                    errors.append("Para CodeType=container, ImageUri é obrigatório.")
+                elif code_type == 'inline_text' and (not events.get('RawCode') or not events.get('HandlerFileName')):
+                    errors.append("Para CodeType=inline_text, RawCode e HandlerFileName são obrigatórios.")
+
+            elif action == 'updateAlias':
+                if not events.get('AliasName') or not events.get('FunctionVersion'):
+                    errors.append("Para updateAlias, AliasName e FunctionVersion são obrigatórios.")
+            
+            if errors:
+                raise Exception(f"Erro de validação de parâmetros: {', '.join(errors)}")
+            return {"status": "Validation OK"}
+      InputPayload:
+        LambdaName: '{{ LambdaName }}'
+        ActionType: '{{ ActionType }}'
+        ConfigKey: '{{ ConfigKey }}'
+        ConfigValue: '{{ ConfigValue }}'
+        CodeType: '{{ CodeType }}'
+        S3Bucket: '{{ S3Bucket }}'
+        S3Key: '{{ S3Key }}'
+        ImageUri: '{{ ImageUri }}'
+        HandlerFileName: '{{ HandlerFileName }}'
+        RawCode: '{{ RawCode }}'
+        AliasName: '{{ AliasName }}'
+        FunctionVersion: '{{ FunctionVersion }}'
+  - name: executeAction
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: deleteLambda
+          Variable: '{{ ActionType }}'
+          StringEquals: delete
+        - NextStep: updateConfigLambda
+          Variable: '{{ ActionType }}'
+          StringEquals: updateConfig
+        - NextStep: updateCodeLambda
+          Variable: '{{ ActionType }}'
+          StringEquals: updateCode
+        - NextStep: updateAliasLambda
+          Variable: '{{ ActionType }}'
+          StringEquals: updateAlias
+      Default: reportSuccess
+  - name: deleteLambda
+    action: aws:executeAwsApi
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: lambda
+      Api: DeleteFunction
+      FunctionName: '{{ LambdaName }}'
+  - name: updateConfigLambda
+    action: aws:executeScript
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      Script: |
+        import boto3
+        def handler(events, context):
+            client = boto3.client('lambda')
+            params = { 'FunctionName': events['LambdaName'] }
+            key = events['ConfigKey']
+            value = events['ConfigValue']
+            if key == 'EphemeralStorage':
+                params[key] = {"Size": int(value)}
+            elif key in ['MemorySize', 'Timeout']:
+                params[key] = int(value)
+            else: 
+                params[key] = value 
+            client.update_function_configuration(**params)
+            return {"message": f"Configuração {key} atualizada."}
+      InputPayload:
+        LambdaName: '{{ LambdaName }}'
+        ConfigKey: '{{ ConfigKey }}'
+        ConfigValue: '{{ ConfigValue }}'
+  - name: updateCodeLambda
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: updateCodeS3
+          Variable: '{{ CodeType }}'
+          StringEquals: s3
+        - NextStep: updateCodeContainer
+          Variable: '{{ CodeType }}'
+          StringEquals: container
+        - NextStep: processAndDeployInlineText
+          Variable: '{{ CodeType }}'
+          StringEquals: inline_text
+      Default: reportSuccess
+  - name: updateCodeS3
+    action: aws:executeAwsApi
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: lambda
+      Api: UpdateFunctionCode
+      FunctionName: '{{ LambdaName }}'
+      S3Bucket: '{{ S3Bucket }}'
+      S3Key: '{{ S3Key }}'
+  - name: updateCodeContainer
+    action: aws:executeAwsApi
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: lambda
+      Api: UpdateFunctionCode
+      FunctionName: '{{ LambdaName }}'
+      ImageUri: '{{ ImageUri }}'
+  - name: processAndDeployInlineText
+    action: aws:executeScript
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      Script: |
+        import boto3
+        import io
+        import zipfile
+        import time
+
+        # 1. Descobrir dinamicamente o ID da conta
+        sts_client = boto3.client('sts')
+        account_id = sts_client.get_caller_identity()['Account']
+
+        # 2. Montar o nome do bucket de staging padronizado
+        STAGING_BUCKET = f"lambda-artifact-staging-{account_id}"
+
+        def handler(events, context):
+            # 3. Obter os parâmetros de entrada
+            lambda_name = events['LambdaName']
+            file_name = events['HandlerFileName']
+            raw_code = events['RawCode']
+            
+            # 4. Criar o arquivo zip em memória
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_f:
+                zip_f.writestr(file_name, raw_code)
+            zip_buffer.seek(0)
+            
+            # 5. Fazer upload do zip para o S3
+            s3_key = f"auto-deploy-{lambda_name}-{int(time.time())}.zip"
+            s3 = boto3.client('s3')
+            
+            s3.upload_fileobj(zip_buffer, STAGING_BUCKET, s3_key)
+            
+            # 6. Chamar a API do Lambda para atualizar
+            lambda_client = boto3.client('lambda')
+            response = lambda_client.update_function_code(
+                FunctionName=lambda_name,
+                S3Bucket=STAGING_BUCKET,
+                S3Key=s3_key
+            )
+            return {"message": f"Código inline implantado via S3. Status: {response['LastUpdateStatus']}"}
+      InputPayload:
+        LambdaName: '{{ LambdaName }}'
+        HandlerFileName: '{{ HandlerFileName }}'
+        RawCode: '{{ RawCode }}'
+  - name: updateAliasLambda
+    action: aws:executeAwsApi
+    nextStep: reportSuccess
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: lambda
+      Api: UpdateAlias
+      FunctionName: '{{ LambdaName }}'
+      Name: '{{ AliasName }}'
+      FunctionVersion: '{{ FunctionVersion }}'
+  - name: reportSuccess
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      Script: |
+        def handler(events, context):
+          action = events.get('ActionType', 'desconhecida')
+          lambda_name = events.get('LambdaName', 'desconhecido')
+          
+          print(f"Ação '{action}' na função '{lambda_name}' foi concluída com sucesso.")
+          return {"status": "SUCCESS", "message": "Ação executada com sucesso!"}
+      InputPayload:
+        ActionType: '{{ ActionType }}'
+        LambdaName: '{{ LambdaName }}'
